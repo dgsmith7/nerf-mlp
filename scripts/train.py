@@ -85,11 +85,28 @@ def calculate_etc(current_step, total_steps, start_time, iteration_times):
     recent_times = iteration_times[-100:]
     median_iter_time = float(np.median(recent_times))
     mean_iter_time = float(np.mean(recent_times))
-    # If mean is much higher than median, warn about instability
-    eta_unstable = mean_iter_time > 3 * median_iter_time
+    
+    # Sanity checks for unrealistic ETAs
+    eta_unstable = False
+    
+    # Check if mean is much larger than median (indicating validation/checkpointing skew)
+    if mean_iter_time > 3 * median_iter_time:
+        eta_unstable = True
+    
+    # Use median for more robust estimation
     avg_iter_time = median_iter_time
     remaining_iterations = total_steps - current_step
     estimated_remaining_seconds = remaining_iterations * avg_iter_time
+    
+    # Check for unrealistic ETA (more than 1 year)
+    max_reasonable_eta = 365 * 24 * 3600  # 1 year in seconds
+    if estimated_remaining_seconds > max_reasonable_eta:
+        estimated_remaining_seconds = max_reasonable_eta
+    
+    # Check for negative or very small ETA
+    if estimated_remaining_seconds <= 0:
+        estimated_remaining_seconds = 0
+    
     completion_time = datetime.now() + timedelta(seconds=estimated_remaining_seconds)
     return {
         'remaining_time': estimated_remaining_seconds,
@@ -101,7 +118,7 @@ def calculate_etc(current_step, total_steps, start_time, iteration_times):
         'median_iter_time': median_iter_time
     }
 
-def validate(model, renderer, val_loader, device, subset_size=None):
+def validate(model, renderer, val_loader, device, subset_size=None, show_progress=True):
     """
     Validate model with optional subset sampling for faster validation
     Returns comprehensive metrics
@@ -112,6 +129,17 @@ def validate(model, renderer, val_loader, device, subset_size=None):
     val_ssim = 0
     count = 0
     subset_count = 0
+    
+    # Calculate total iterations for progress bar
+    total_batches = len(val_loader)
+    if subset_size is not None:
+        total_batches = min(total_batches, subset_size)
+    
+    # Create progress bar if requested
+    if show_progress:
+        from tqdm import tqdm
+        pbar = tqdm(total=total_batches, desc="Validation", unit="batch")
+    
     with torch.no_grad():
         for batch in val_loader:
             if subset_size is not None and subset_count >= subset_size:
@@ -129,6 +157,18 @@ def validate(model, renderer, val_loader, device, subset_size=None):
             val_ssim += batch_ssim * ray_o.shape[0]
             count += ray_o.shape[0]
             subset_count += 1
+            
+            # Update progress bar
+            if show_progress:
+                pbar.update(1)
+                # Update description with current metrics
+                current_loss = val_loss / count if count > 0 else 0
+                current_psnr = val_psnr / count if count > 0 else 0
+                pbar.set_description(f"Validation (Loss: {current_loss:.4f}, PSNR: {current_psnr:.2f})")
+    
+    if show_progress:
+        pbar.close()
+    
     model.train()
     return {
         'loss': val_loss / count if count > 0 else 0,
@@ -149,7 +189,21 @@ def main():
     parser.add_argument('--full_val_interval', type=int, default=10000, help='Full validation every N iterations (default: 10000)')
     parser.add_argument('--quick_val_res', type=int, nargs=2, default=[256, 256], help='Quick validation resolution (default: 256 256)')
     parser.add_argument('--quick_val_subset', type=int, default=10, help='Number of images for quick validation (default: 10)')
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from (e.g., outputs/checkpoints/metrics_latest.pth)')
     args = parser.parse_args()
+
+    # Warn about high-resolution training
+    if args.img_wh[0] >= 1024 or args.img_wh[1] >= 1024:
+        print("⚠️  WARNING: High resolution training detected!")
+        print("   For 1024x1024 resolution, consider these optimized parameters:")
+        print("   • Batch size: 512-1024 (instead of 256)")
+        print("   • Learning rate: 1e-4 (instead of 5e-4)")
+        print("   • Current settings: batch_size={}, lr={:.1e}".format(args.batch_size, args.lr))
+        if args.batch_size < 512:
+            print("   ⚠️  Batch size may be too small for high resolution")
+        if args.lr > 2e-4:
+            print("   ⚠️  Learning rate may be too high for high resolution")
+        print()
 
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
     print(f'Using device: {device}')
@@ -177,15 +231,33 @@ def main():
     # Calculate dynamic near/far based on camera positions
     poses = dataset.poses
     positions = np.array([pose[:3, 3] for pose in poses])
+    
+    # Check if cameras are on a sphere (common in NeRF datasets)
     dists = np.linalg.norm(positions, axis=1)
-    near = max(0.1, dists.min() - 0.5)
-    far = dists.max() + 0.5
+    dist_std = dists.std()
+    
+    if dist_std < 0.01:  # Cameras are on a sphere
+        print(f"📐 Detected spherical camera arrangement (distance std: {dist_std:.6f})")
+        # Use scene bounds instead of camera distances
+        scene_center = np.mean(positions, axis=0)
+        scene_radius = np.linalg.norm(positions - scene_center, axis=1).max()
+        
+        # For spherical scenes, use a wider range that covers the scene
+        near = max(0.1, scene_radius * 0.5)  # Start at half the scene radius
+        far = scene_radius * 2.0  # Extend to twice the scene radius
+        print(f"🎯 Scene-based near/far: near={near:.3f}, far={far:.3f} (scene_radius={scene_radius:.3f})")
+    else:
+        # Original calculation for non-spherical scenes
+        near = max(0.1, dists.min() - 0.5)
+        far = dists.max() + 0.5
+        print(f"📐 Camera-based near/far: near={near:.3f}, far={far:.3f}")
+    
     print(f"Dynamic near: {near}, far: {far}")
     
     renderer = NeRFRenderer(model, device, near=near, far=far)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    os.makedirs(args.save_dir, exist_ok=True)
+    # Checkpoint resumption
     step = 0
     train_losses = []
     train_psnrs = []
@@ -214,6 +286,79 @@ def main():
     summary_train_loss = 0
     summary_train_psnr = 0
     summary_train_count = 0
+    
+    # Resume from checkpoint if specified
+    if args.resume:
+        if os.path.exists(args.resume):
+            print(f"🔄 Resuming from checkpoint: {args.resume}")
+            checkpoint = torch.load(args.resume, map_location=device)
+            
+            # Load model state
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                print(f"✅ Model state loaded")
+            
+            # Load optimizer state
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                print(f"✅ Optimizer state loaded")
+            
+            # Load training state
+            if 'metrics' in checkpoint:
+                metrics = checkpoint['metrics']
+                step = metrics.get('step', 0)
+                train_losses = metrics.get('train_losses', [])
+                train_psnrs = metrics.get('train_psnrs', [])
+                quick_val_losses = metrics.get('quick_val_losses', [])
+                quick_val_psnrs = metrics.get('quick_val_psnrs', [])
+                quick_val_ssims = metrics.get('quick_val_ssims', [])
+                val_steps = metrics.get('val_steps', [])
+                iteration_times = metrics.get('iteration_times', [])
+                best_val_psnr = metrics.get('best_val_psnr', 0)
+                
+                # Convert back from JSON format if needed
+                if isinstance(train_losses, list) and len(train_losses) > 0 and isinstance(train_losses[0], str):
+                    train_losses = [float(x) for x in train_losses]
+                if isinstance(train_psnrs, list) and len(train_psnrs) > 0 and isinstance(train_psnrs[0], str):
+                    train_psnrs = [float(x) for x in train_psnrs]
+                if isinstance(quick_val_losses, list) and len(quick_val_losses) > 0 and isinstance(quick_val_losses[0], str):
+                    quick_val_losses = [float(x) for x in quick_val_losses]
+                if isinstance(quick_val_psnrs, list) and len(quick_val_psnrs) > 0 and isinstance(quick_val_psnrs[0], str):
+                    quick_val_psnrs = [float(x) for x in quick_val_psnrs]
+                if isinstance(quick_val_ssims, list) and len(quick_val_ssims) > 0 and isinstance(quick_val_ssims[0], str):
+                    quick_val_ssims = [float(x) for x in quick_val_ssims]
+                if isinstance(val_steps, list) and len(val_steps) > 0 and isinstance(val_steps[0], str):
+                    val_steps = [int(x) for x in val_steps]
+                if isinstance(iteration_times, list) and len(iteration_times) > 0 and isinstance(iteration_times[0], str):
+                    iteration_times = [float(x) for x in iteration_times]
+                
+                print(f"✅ Training state loaded: step {step:,}, {len(train_losses)} train metrics, {len(quick_val_losses)} val metrics")
+                print(f"✅ Best validation PSNR: {best_val_psnr:.2f}")
+                
+                # Set timing variables
+                if iteration_times:
+                    training_step_times = iteration_times.copy()
+                    print(f"✅ Timing data loaded: {len(iteration_times)} iterations")
+                
+                # Set last validation info
+                if quick_val_losses and quick_val_psnrs and val_steps:
+                    last_val_loss = quick_val_losses[-1]
+                    last_val_psnr = quick_val_psnrs[-1]
+                    last_val_step = val_steps[-1]
+                    print(f"✅ Last validation: step {last_val_step:,}, loss {last_val_loss:.6f}, PSNR {last_val_psnr:.2f}")
+            else:
+                # Fallback: try to load just step number
+                step = checkpoint.get('step', 0)
+                print(f"⚠️  No metrics found, starting from step {step:,}")
+            
+            print(f"🔄 Resuming training from step {step:,} (target: {args.iters:,})")
+            print(f"📊 Progress: {(step / args.iters) * 100:.1f}% complete")
+            
+        else:
+            print(f"❌ Checkpoint not found: {args.resume}")
+            print("Starting training from scratch...")
+
+    os.makedirs(args.save_dir, exist_ok=True)
     
     while step < args.iters:
         iter_start_time = time.time()
@@ -247,10 +392,6 @@ def main():
             summary_train_psnr += batch_psnr * ray_o.shape[0]
             summary_train_count += ray_o.shape[0]
             
-            iter_time = time.time() - iter_start_time
-            iteration_times.append(iter_time)
-            training_step_times.append(iter_time)
-            
             if step % 100 == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 memory_gb = get_memory_usage()
@@ -270,7 +411,7 @@ def main():
                 running_train_psnr = 0
                 running_train_count = 0
                 
-                quick_metrics = validate(model, renderer, quick_val_loader, device, args.quick_val_subset)
+                quick_metrics = validate(model, renderer, quick_val_loader, device, args.quick_val_subset, show_progress=False)
                 quick_val_losses.append(quick_metrics['loss'])
                 quick_val_psnrs.append(quick_metrics['psnr'])
                 quick_val_ssims.append(quick_metrics['ssim'])
@@ -358,13 +499,40 @@ def main():
                 # ETA based only on training step times
                 if training_step_times:
                     median_train_time = np.median(training_step_times[-100:])
+                    mean_train_time = np.mean(training_step_times[-100:])
                     remaining_steps = args.iters - step
                     eta_seconds = remaining_steps * median_train_time
+                    
+                    # Sanity checks for unrealistic ETAs
+                    eta_unstable = False
+                    eta_warning = ""
+                    
+                    # Check if mean is much larger than median (indicating validation/checkpointing skew)
+                    if mean_train_time > 3 * median_train_time:
+                        eta_unstable = True
+                        eta_warning = f" (unstable: mean {mean_train_time:.3f}s > 3x median {median_train_time:.3f}s)"
+                    
+                    # Check for unrealistic ETA (more than 1 year)
+                    max_reasonable_eta = 365 * 24 * 3600  # 1 year in seconds
+                    if eta_seconds > max_reasonable_eta:
+                        eta_seconds = max_reasonable_eta
+                        eta_warning += " (capped at 1 year - timing may be skewed)"
+                    
+                    # Check for negative or very small ETA
+                    if eta_seconds <= 0:
+                        eta_seconds = 0
+                        eta_warning += " (negative ETA - timing issue detected)"
+                    
                     eta_str = format_time_duration(eta_seconds)
                     eta_time = (datetime.now() + timedelta(seconds=eta_seconds)).strftime('%Y-%m-%d %H:%M:%S')
+                    
+                    # Add debug info for timing issues
+                    if eta_unstable or eta_warning:
+                        print(f"  ⚠️  Timing Debug: median={median_train_time:.3f}s, mean={mean_train_time:.3f}s, last 100 times range=[{min(training_step_times[-100:]):.3f}s, {max(training_step_times[-100:]):.3f}s]")
                 else:
                     eta_str = 'N/A'
                     eta_time = 'N/A'
+                    eta_warning = ""
                 print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | SUMMARY @ Iter {step:,}")
                 print(f"  Avg Train Loss (last {summary_interval}): {avg_train_loss:.6f}")
                 print(f"  Avg Train PSNR (last {summary_interval}): {avg_train_psnr:.2f}")
@@ -372,12 +540,17 @@ def main():
                     print(f"  Last Validation @ Iter {last_val_step:,}: Loss={last_val_loss:.6f}, PSNR={last_val_psnr:.2f}")
                 else:
                     print("  Last Validation: (not yet run)")
-                print(f"  ETA: {eta_str} (approx {eta_time}) [based on training steps only]")
+                print(f"  ETA: {eta_str} (approx {eta_time}) [based on training steps only]{eta_warning}")
                 print("=" * 80)
                 # Reset summary counters
                 summary_train_loss = 0
                 summary_train_psnr = 0
                 summary_train_count = 0
+            
+            # Measure iteration time (after batch loop ends)
+            iter_time = time.time() - iter_start_time
+            iteration_times.append(iter_time)
+            training_step_times.append(iter_time)
             
             step += 1
             if step >= args.iters:

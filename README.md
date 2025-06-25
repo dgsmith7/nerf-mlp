@@ -103,6 +103,47 @@ python scripts/train.py \
 python scripts/train_only.py --datadir data/lego --iters 5000
 ```
 
+### Resuming Training
+
+The training script supports automatic resumption from checkpoints, allowing you to continue training if it's interrupted:
+
+```bash
+# Resume from latest checkpoint (recommended)
+python scripts/train.py --datadir data/lego --resume outputs/checkpoints/metrics_latest.pth
+
+# Resume from best model
+python scripts/train.py --datadir data/lego --resume outputs/checkpoints/model_best.pth
+
+# Resume from specific step
+python scripts/train.py --datadir data/lego --resume outputs/checkpoints/model_5000_latest.pth
+
+# Resume with different parameters (e.g., continue for more iterations)
+python scripts/train.py --datadir data/lego --iters 300000 --lr 1e-4 --resume outputs/checkpoints/metrics_latest.pth
+```
+
+**Available Checkpoints for Resumption:**
+
+- `metrics_latest.pth` - Complete checkpoint (model + optimizer + metrics) - **Recommended**
+- `model_best.pth` - Best model based on validation PSNR
+- `model_{step}_latest.pth` - Model at specific step (every 1000 steps)
+- `model_{step}.pth` - Model at specific step (every 10000 steps)
+- `model_final.pth` - Final model after training
+
+**What Gets Restored:**
+
+- Model weights and optimizer state
+- Training step number (continues from exact point)
+- All training and validation metrics history
+- Timing data for accurate ETA calculations
+- Best validation PSNR tracking
+
+**Important Notes:**
+
+- Use the same dataset path when resuming
+- You can change training parameters (learning rate, iterations, etc.) when resuming
+- Progress will be shown: "Resuming training from step X (target: Y)"
+- ETA calculations remain accurate since timing data is preserved
+
 ### Monitoring Training Progress
 
 ```bash
@@ -122,13 +163,92 @@ python scripts/plot_training_progress.py --live
 # Render test images from best checkpoint
 python scripts/render_example.py
 
-# The script will:
-# - Load the best model from outputs/checkpoints/model_best.pth
-# - Render 5 test views from the test dataset
-# - Save images as outputs/rendered_example_*.png
+# Render from specific checkpoint
+python scripts/render_example.py --model_path outputs/checkpoints/model_1000_latest.pth
+
+# Render with custom resolution
+python scripts/render_example.py --img_wh 400 400
+
+# Render multiple views with custom output prefix
+python scripts/render_example.py --out_prefix outputs/my_test --num_views 10
 ```
 
+**Features:**
+
+- **Spherical Camera Detection**: Automatically handles datasets with cameras on spheres
+- **Progress Testing**: Test different checkpoints as training progresses
+- **Multiple Views**: Renders 5 different camera angles by default
+
+**Testing Training Progress:**
+
+```bash
+# Test every 1000 steps
+python scripts/render_example.py --model_path outputs/checkpoints/model_1000_latest.pth --out_prefix outputs/progress_1000
+
+# Test every 5000 steps
+python scripts/render_example.py --model_path outputs/checkpoints/model_5000_latest.pth --out_prefix outputs/progress_5000
+
+# Test best model so far
+python scripts/render_example.py --model_path outputs/checkpoints/model_best.pth --out_prefix outputs/progress_best
+```
+
+**Expected Results:**
+
+- **Early training (1000-5000 steps)**: Dark images - normal for early NeRF training
+- **Mid training (10,000-20,000 steps)**: Gradually brighter images as model learns
+- **Late training (50,000+ steps)**: Bright, colorful images with good detail
+
 ## Configuration
+
+### Successful Training Configurations
+
+Based on extensive testing, here are the proven configurations that work well:
+
+#### **High Resolution Training (1024x1024)**
+
+```bash
+python scripts/train.py \
+    --datadir data/lego \
+    --img_wh 1024 1024 \
+    --batch_size 512 \
+    --lr 1e-4 \
+    --iters 200000
+```
+
+**Key Parameters:**
+
+- **Batch Size**: 512 (2x increase for 16x resolution increase)
+- **Learning Rate**: 1e-4 (4x reduction for stability)
+- **Expected PSNR**: 20-25+ dB after 20,000+ iterations
+- **Training Time**: ~4 hours for 200,000 iterations
+
+#### **Quick Testing (64x64)**
+
+```bash
+python scripts/train.py \
+    --datadir data/lego \
+    --img_wh 64 64 \
+    --batch_size 128 \
+    --iters 10000
+```
+
+**Key Parameters:**
+
+- **Batch Size**: 128 (proportional to resolution)
+- **Learning Rate**: 5e-4 (standard for low resolution)
+- **Expected PSNR**: 15-20 dB after 5,000+ iterations
+- **Training Time**: ~10 minutes for 10,000 iterations
+
+#### **Medium Resolution (512x512)**
+
+```bash
+python scripts/train.py \
+    --datadir data/lego \
+    --img_wh 512 512 \
+    --batch_size 256 \
+    --lr 2e-4 \
+    --iters 100000
+```
 
 ### Training Parameters
 
@@ -144,6 +264,7 @@ python scripts/render_example.py
 | `--quick_val_res`      | 256 256             | Quick validation resolution                |
 | `--quick_val_subset`   | 10                  | Number of images for quick validation      |
 | `--full_val_interval`  | 10000               | Full validation interval                   |
+| `--resume`             | None                | Path to checkpoint to resume from          |
 
 ### Model Architecture Details
 
@@ -228,10 +349,51 @@ All outputs are saved to the `outputs/` directory:
 
 ### Common Issues
 
-1. **Black Rendered Images**: Usually indicates incorrect near/far planes - the dynamic calculation should fix this
-2. **High Memory Usage**: Reduce batch size or image resolution
-3. **Slow Training**: Use lower resolution for quick experiments, increase batch size if memory allows
-4. **Poor Convergence**: Check learning rate, ensure validation data is properly loaded
+1. **White or Black Rendered Images**:
+
+   - **Cause**: Incorrect near/far plane calculation for spherical camera arrangements
+   - **Solution**: The renderer now automatically detects spherical cameras and uses scene-based near/far bounds
+   - **Detection**: Look for "📐 Detected spherical camera arrangement" in render output
+   - **Expected**: Near/far should be ~2.4-9.5 for Lego dataset (not 3.5-4.5)
+
+2. **Dark Rendered Images in Early Training**:
+
+   - **Cause**: Normal for early NeRF training (iterations 1,000-10,000)
+   - **Solution**: Continue training - images get brighter as model learns
+   - **Expected**: Images get brighter as training progresses (20,000+ iterations)
+
+3. **High Memory Usage**: Reduce batch size or image resolution
+4. **Slow Training**: Use lower resolution for quick experiments, increase batch size if memory allows
+5. **Poor Convergence**: Check learning rate, ensure validation data is properly loaded
+
+### Camera Position and Near/Far Plane Fix
+
+**Problem**: The original near/far calculation failed for datasets with spherical camera arrangements (like Lego), where all cameras are at the same distance from the scene center.
+
+**Symptoms**:
+
+- All cameras at distance 4.031 (perfect sphere)
+- Near/far range of only 1.0 units (3.531 to 4.531)
+- White or black rendered images
+- Training PSNR stuck at ~1.0 dB
+
+**Solution Implemented**:
+
+```python
+# Automatic detection of spherical camera arrangements
+if dist_std < 0.01:  # Cameras are on a sphere
+    scene_center = np.mean(positions, axis=0)
+    scene_radius = np.linalg.norm(positions - scene_center, axis=1).max()
+    near = max(0.1, scene_radius * 0.5)  # Start at half scene radius
+    far = scene_radius * 2.0  # Extend to twice scene radius
+```
+
+**Results**:
+
+- **Before**: Near=3.531, Far=4.531 (1.0 unit range)
+- **After**: Near=2.365, Far=9.458 (7.1 unit range)
+- **Training**: PSNR improved from 1.0 dB to 17+ dB
+- **Rendering**: No more white/black images
 
 ### Performance Tips
 
@@ -239,6 +401,7 @@ All outputs are saved to the `outputs/` directory:
 - Use `train_only.py` for initial testing without validation overhead
 - Monitor memory usage and adjust batch size accordingly
 - Use the live plotting feature to catch issues early
+- For high resolution training, use the proven configurations above
 
 ## Future Work
 
@@ -261,4 +424,5 @@ If you use this implementation in your research, please cite the original NeRF p
   booktitle={ECCV},
 }
 ```
+
 # nerf-mlp

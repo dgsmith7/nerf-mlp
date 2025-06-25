@@ -73,9 +73,27 @@ def main():
     # Calculate dynamic near/far based on camera positions
     poses = dataset.poses
     positions = np.array([pose[:3, 3] for pose in poses])
+    
+    # Check if cameras are on a sphere (common in NeRF datasets)
     dists = np.linalg.norm(positions, axis=1)
-    near = max(0.1, dists.min() - 0.5)
-    far = dists.max() + 0.5
+    dist_std = dists.std()
+    
+    if dist_std < 0.01:  # Cameras are on a sphere
+        print(f"📐 Detected spherical camera arrangement (distance std: {dist_std:.6f})")
+        # Use scene bounds instead of camera distances
+        scene_center = np.mean(positions, axis=0)
+        scene_radius = np.linalg.norm(positions - scene_center, axis=1).max()
+        
+        # For spherical scenes, use a wider range that covers the scene
+        near = max(0.1, scene_radius * 0.5)  # Start at half the scene radius
+        far = scene_radius * 2.0  # Extend to twice the scene radius
+        print(f"🎯 Scene-based near/far: near={near:.3f}, far={far:.3f} (scene_radius={scene_radius:.3f})")
+    else:
+        # Original calculation for non-spherical scenes
+        near = max(0.1, dists.min() - 0.5)
+        far = dists.max() + 0.5
+        print(f"📐 Camera-based near/far: near={near:.3f}, far={far:.3f}")
+    
     print(f"Dynamic near: {near}, far: {far}")
     
     renderer = NeRFRenderer(model, device, near=near, far=far)

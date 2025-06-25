@@ -3,19 +3,35 @@ import sys
 # Add the project root to Python path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import argparse
 import torch
 import numpy as np
 from PIL import Image
 from nerfmlp import NeRFMLP, NeRFRenderer, NeRFDataset
 
 def main():
+    parser = argparse.ArgumentParser(description='Render test images from trained NeRF model')
+    parser.add_argument('--model_path', type=str, default='outputs/checkpoints/model_best.pth',
+                       help='Path to model checkpoint (default: outputs/checkpoints/model_best.pth)')
+    parser.add_argument('--datadir', type=str, default='./data/lego',
+                       help='Path to dataset directory (default: ./data/lego)')
+    parser.add_argument('--split', type=str, default='train',
+                       help='Dataset split to use (default: train)')
+    parser.add_argument('--img_wh', type=int, nargs=2, default=[400, 400],
+                       help='Image width and height (default: 400 400)')
+    parser.add_argument('--num_views', type=int, default=5,
+                       help='Number of views to render (default: 5)')
+    parser.add_argument('--out_prefix', type=str, default='outputs/rendered_example',
+                       help='Output file prefix (default: outputs/rendered_example)')
+    args = parser.parse_args()
+
     # --- Config ---
-    datadir = './data/lego'
-    split = 'train'  # Use training poses for now
-    img_wh = (400, 400)  # Higher resolution for better quality
-    model_path = 'outputs/checkpoints/model_best.pth'  # Use the best model from main checkpoints
-    out_prefix = 'outputs/rendered_example'
-    num_views = 5
+    datadir = args.datadir
+    split = args.split
+    img_wh = tuple(args.img_wh)
+    model_path = args.model_path
+    out_prefix = args.out_prefix
+    num_views = args.num_views
 
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 
@@ -37,9 +53,27 @@ def main():
 
     # --- Dynamic near/far calculation ---
     positions = np.array([pose[:3, 3] for pose in poses])
+    
+    # Check if cameras are on a sphere (common in NeRF datasets)
     dists = np.linalg.norm(positions, axis=1)
-    near = max(0.1, dists.min() - 0.5)
-    far = dists.max() + 0.5
+    dist_std = dists.std()
+    
+    if dist_std < 0.01:  # Cameras are on a sphere
+        print(f"📐 Detected spherical camera arrangement (distance std: {dist_std:.6f})")
+        # Use scene bounds instead of camera distances
+        scene_center = np.mean(positions, axis=0)
+        scene_radius = np.linalg.norm(positions - scene_center, axis=1).max()
+        
+        # For spherical scenes, use a wider range that covers the scene
+        near = max(0.1, scene_radius * 0.5)  # Start at half the scene radius
+        far = scene_radius * 2.0  # Extend to twice the scene radius
+        print(f"🎯 Scene-based near/far: near={near:.3f}, far={far:.3f} (scene_radius={scene_radius:.3f})")
+    else:
+        # Original calculation for non-spherical scenes
+        near = max(0.1, dists.min() - 0.5)
+        far = dists.max() + 0.5
+        print(f"📐 Camera-based near/far: near={near:.3f}, far={far:.3f}")
+    
     print(f"Dynamic near: {near}, far: {far}")
 
     # --- Load model ---
