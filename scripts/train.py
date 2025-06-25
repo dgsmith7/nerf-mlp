@@ -181,7 +181,7 @@ def main():
     parser.add_argument('--datadir', type=str, required=True, help='Path to dataset directory')
     parser.add_argument('--split', type=str, default='train', help='Dataset split (train/val/test)')
     parser.add_argument('--img_wh', type=int, nargs=2, default=[1024, 1024], help='Image width and height (e.g., 1024 1024 for high-res, 400 400 for fast)')
-    parser.add_argument('--batch_size', type=int, default=256, help='Batch size (default 256 for 1024x1024, increase for lower res)')
+    parser.add_argument('--batch_size', type=int, default=1024, help='Batch size (default 1024 for NeRF)')
     parser.add_argument('--iters', type=int, default=200000, help='Number of training iterations')
     parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
     parser.add_argument('--save_dir', type=str, default='outputs/checkpoints', help='Directory to save checkpoints')
@@ -254,8 +254,10 @@ def main():
     
     print(f"Dynamic near: {near}, far: {far}")
     
-    renderer = NeRFRenderer(model, device, near=near, far=far)
+    renderer = NeRFRenderer(model, device, near=near, far=far, N_samples=64, N_importance=128)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # Learning rate decay: decay by 0.1 every 250,000 steps
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=250000, gamma=0.1)
 
     # Checkpoint resumption
     step = 0
@@ -370,6 +372,7 @@ def main():
             
             # Render
             rgb_pred = renderer._render_rays(ray_o, ray_d)['rgb_map']
+            # MSE loss on linear RGB
             loss = torch.mean((rgb_pred - target_rgb) ** 2)
             
             # Calculate training metrics
@@ -382,6 +385,7 @@ def main():
             grad_norm = get_gradient_norm(model)
             
             optimizer.step()
+            scheduler.step()
             
             running_train_loss += loss.item() * ray_o.shape[0]
             running_train_psnr += batch_psnr * ray_o.shape[0]

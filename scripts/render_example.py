@@ -23,6 +23,8 @@ def main():
                        help='Number of views to render (default: 5)')
     parser.add_argument('--out_prefix', type=str, default='outputs/rendered_example',
                        help='Output file prefix (default: outputs/rendered_example)')
+    parser.add_argument('--view_idx', type=int, default=None,
+                       help='Index of the view to render (overrides num_views if set)')
     args = parser.parse_args()
 
     # --- Config ---
@@ -32,6 +34,7 @@ def main():
     model_path = args.model_path
     out_prefix = args.out_prefix
     num_views = args.num_views
+    view_idx = args.view_idx
 
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 
@@ -92,36 +95,83 @@ def main():
             return
     
     print(f"Loading model from: {model_path}")
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    if model_path.endswith('.npy'):
+        # Load weights from numpy file (assume list of arrays)
+        weights = np.load(model_path, allow_pickle=True)
+        if isinstance(weights, np.lib.npyio.NpzFile):
+            weights = [weights[key] for key in weights.files]
+        elif isinstance(weights, np.ndarray) and weights.dtype == object:
+            weights = list(weights)
+        print("Shapes of loaded .npy arrays:")
+        for i, arr in enumerate(weights):
+            print(f"  Weight {i}: {arr.shape}")
+        print("Shapes of model parameters (expected):")
+        param_list = []
+        for l in model.pts_linears:
+            param_list.append(l.weight.data)
+            param_list.append(l.bias.data)
+        param_list.append(model.feature_linear.weight.data)
+        param_list.append(model.feature_linear.bias.data)
+        param_list.append(model.sigma_linear.weight.data)
+        param_list.append(model.sigma_linear.bias.data)
+        if model.use_viewdirs:
+            param_list.append(model.view_linear.weight.data)
+            param_list.append(model.view_linear.bias.data)
+        param_list.append(model.rgb_linear.weight.data)
+        param_list.append(model.rgb_linear.bias.data)
+        for i, p in enumerate(param_list):
+            print(f"  Model param {i}: {tuple(p.shape)}")
+        # Now try loading (will error, but you'll see the printout)
+        model.load_from_numpy(weights)
+        print("Loaded weights from .npy file using load_from_numpy.")
+    else:
+        model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     renderer = NeRFRenderer(model, device, near=near, far=far)
 
     # --- Render multiple views ---
     with torch.no_grad():
-        for idx in range(num_views):
-            pose_idx = idx % n_poses  # cycle if fewer than 5 poses
+        if view_idx is not None:
+            pose_idx = view_idx % n_poses
             pose = poses[pose_idx]
-            print(f"Rendering view {idx} using pose {pose_idx}")
+            print(f"Rendering view {pose_idx} (user-specified)")
             print(f"Camera position: {pose[:3, 3]}")
-            
             i, j = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')
             dirs = np.stack([(i - W/2)/focal, -(j - H/2)/focal, -np.ones_like(i)], -1)
             rays_d = (dirs @ pose[:3, :3].T).reshape(-1, 3)
             rays_o = np.broadcast_to(pose[:3, 3], rays_d.shape)
             rays_o = torch.from_numpy(rays_o.copy()).float().to(device)
             rays_d = torch.from_numpy(rays_d).float().to(device)
-            
             rgb = renderer.render(rays_o, rays_d, H, W, focal)
             rgb = rgb.cpu().numpy()
-            
             print(f"Rendered RGB range: {rgb.min():.3f} to {rgb.max():.3f}")
             print(f"Rendered RGB mean: {rgb.mean():.3f}")
-            
             rgb = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
-            out_path = f'{out_prefix}_{idx}.png'
+            out_path = f'{out_prefix}_view{pose_idx}.png'
             Image.fromarray(rgb).save(out_path)
             print(f"Rendered image saved to {out_path}")
             print("---")
+        else:
+            for idx in range(num_views):
+                pose_idx = idx % n_poses  # cycle if fewer than 5 poses
+                pose = poses[pose_idx]
+                print(f"Rendering view {idx} using pose {pose_idx}")
+                print(f"Camera position: {pose[:3, 3]}")
+                i, j = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')
+                dirs = np.stack([(i - W/2)/focal, -(j - H/2)/focal, -np.ones_like(i)], -1)
+                rays_d = (dirs @ pose[:3, :3].T).reshape(-1, 3)
+                rays_o = np.broadcast_to(pose[:3, 3], rays_d.shape)
+                rays_o = torch.from_numpy(rays_o.copy()).float().to(device)
+                rays_d = torch.from_numpy(rays_d).float().to(device)
+                rgb = renderer.render(rays_o, rays_d, H, W, focal)
+                rgb = rgb.cpu().numpy()
+                print(f"Rendered RGB range: {rgb.min():.3f} to {rgb.max():.3f}")
+                print(f"Rendered RGB mean: {rgb.mean():.3f}")
+                rgb = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+                out_path = f'{out_prefix}_{idx}.png'
+                Image.fromarray(rgb).save(out_path)
+                print(f"Rendered image saved to {out_path}")
+                print("---")
 
 if __name__ == '__main__':
     main() 
