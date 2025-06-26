@@ -13,6 +13,16 @@ def main():
     parser = argparse.ArgumentParser(description='Render test images from trained NeRF model')
     parser.add_argument('--model_path', type=str, default='outputs/checkpoints/model_best.pth',
                        help='Path to model checkpoint (default: outputs/checkpoints/model_best.pth)')
+    parser.add_argument('--use_fine_weights', action='store_true',
+                       help='Use fine model weights from lego_example_weights')
+    parser.add_argument('--N_samples', type=int, default=None,
+                       help='Number of coarse samples per ray (default: auto-detect)')
+    parser.add_argument('--N_importance', type=int, default=None,
+                       help='Number of fine samples per ray (default: auto-detect)')
+    parser.add_argument('--white_bkgd', action='store_true',
+                       help='Use white background (default: auto-detect)')
+    parser.add_argument('--no_white_bkgd', action='store_true',
+                       help='Use black background')
     parser.add_argument('--datadir', type=str, default='./data/lego',
                        help='Path to dataset directory (default: ./data/lego)')
     parser.add_argument('--split', type=str, default='train',
@@ -20,11 +30,14 @@ def main():
     parser.add_argument('--img_wh', type=int, nargs=2, default=[400, 400],
                        help='Image width and height (default: 400 400)')
     parser.add_argument('--num_views', type=int, default=5,
-                       help='Number of views to render (default: 5)')
-    parser.add_argument('--out_prefix', type=str, default='outputs/rendered_example',
-                       help='Output file prefix (default: outputs/rendered_example)')
+                       help='Number of views to render')
+    parser.add_argument('--out_prefix', type=str, default='rendered_example',
+                       help='Output filename prefix')
     parser.add_argument('--view_idx', type=int, default=None,
-                       help='Index of the view to render (overrides num_views if set)')
+                       help='Specific view index to render (if not specified, renders multiple views)')
+    parser.add_argument('--near', type=float, default=None, help='Near bound override')
+    parser.add_argument('--far', type=float, default=None, help='Far bound override')
+    parser.add_argument('--coord_scale', type=float, default=None, help='Coordinate scaling factor to match model expectations')
     args = parser.parse_args()
 
     # --- Config ---
@@ -35,6 +48,14 @@ def main():
     out_prefix = args.out_prefix
     num_views = args.num_views
     view_idx = args.view_idx
+    use_fine_weights = args.use_fine_weights
+    N_samples = args.N_samples
+    N_importance = args.N_importance
+    white_bkgd = args.white_bkgd
+    no_white_bkgd = args.no_white_bkgd
+    near = args.near
+    far = args.far
+    coord_scale = args.coord_scale
 
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 
@@ -42,57 +63,84 @@ def main():
     dataset = NeRFDataset(datadir, split=split, img_wh=img_wh)
     H, W = img_wh
     focal = dataset.focal
-    poses = dataset.poses
-    n_poses = len(poses)
+    poses = np.array(dataset.poses)  # Convert to numpy array
     
-    print(f"Loaded {n_poses} poses from {split} split")
+    print(f"Loaded {len(poses)} poses from {args.split} split")
     print(f"Focal length: {focal}")
-    print(f"Image dimensions: {img_wh}")
-    
-    # Print first few camera positions for debugging
-    for i in range(min(3, n_poses)):
-        pos = poses[i][:3, 3]
-        print(f"Camera {i} position: {pos}")
+    print(f"Image dimensions: ({H}, {W})")
 
-    # --- Dynamic near/far calculation ---
-    positions = np.array([pose[:3, 3] for pose in poses])
-    
-    # Check if cameras are on a sphere (common in NeRF datasets)
-    dists = np.linalg.norm(positions, axis=1)
-    dist_std = dists.std()
-    
-    if dist_std < 0.01:  # Cameras are on a sphere
-        print(f"📐 Detected spherical camera arrangement (distance std: {dist_std:.6f})")
-        # Use scene bounds instead of camera distances
-        scene_center = np.mean(positions, axis=0)
-        scene_radius = np.linalg.norm(positions - scene_center, axis=1).max()
-        
-        # For spherical scenes, use a wider range that covers the scene
-        near = max(0.1, scene_radius * 0.5)  # Start at half the scene radius
-        far = scene_radius * 2.0  # Extend to twice the scene radius
-        print(f"🎯 Scene-based near/far: near={near:.3f}, far={far:.3f} (scene_radius={scene_radius:.3f})")
+    # Apply coordinate scaling to camera poses if specified
+    if coord_scale is not None:
+        print(f"🔧 Using coordinate scaling factor: {coord_scale}")
+        poses_original = poses.copy()
+        poses_for_bounds = poses.copy()
+        poses_for_bounds[:, :3, 3] *= coord_scale  # Scale camera positions ONLY for bounds calculation
+        print(f"Original camera range: X[{poses_original[:, 0, 3].min():.3f}, {poses_original[:, 0, 3].max():.3f}] Y[{poses_original[:, 1, 3].min():.3f}, {poses_original[:, 1, 3].max():.3f}] Z[{poses_original[:, 2, 3].min():.3f}, {poses_original[:, 2, 3].max():.3f}]")
+        print(f"Scaled camera range: X[{poses_for_bounds[:, 0, 3].min():.3f}, {poses_for_bounds[:, 0, 3].max():.3f}] Y[{poses_for_bounds[:, 1, 3].min():.3f}, {poses_for_bounds[:, 1, 3].max():.3f}] Z[{poses_for_bounds[:, 2, 3].min():.3f}, {poses_for_bounds[:, 2, 3].max():.3f}]")
+        # IMPORTANT: Keep original poses for ray generation!
+        poses_for_rendering = poses_original.copy()
     else:
-        # Original calculation for non-spherical scenes
-        near = max(0.1, dists.min() - 0.5)
-        far = dists.max() + 0.5
-        print(f"📐 Camera-based near/far: near={near:.3f}, far={far:.3f}")
+        coord_scale = 1.0  # Default to no scaling
+        poses_for_bounds = poses.copy()
+        poses_for_rendering = poses.copy()
     
-    print(f"Dynamic near: {near}, far: {far}")
+    # Print first few camera positions for debugging  
+    for i in range(min(3, len(poses_for_rendering))):
+        pos = poses_for_rendering[i, :3, 3]
+        print(f"Camera {i} position (for rendering): {pos}")
+
+    # Calculate dynamic near/far bounds based on SCALED scene geometry
+    scene_center = np.array([pose[:3, 3] for pose in poses_for_bounds]).mean(axis=0)
+    camera_distances = np.linalg.norm(np.array([pose[:3, 3] for pose in poses_for_bounds]) - scene_center, axis=1)
+    scene_radius = camera_distances.max()
+    
+    # Use dynamic bounds, with command line overrides if provided
+    if near is not None and far is not None:
+        dynamic_near, dynamic_far = near, far
+        print(f"Using command line bounds: near={dynamic_near}, far={dynamic_far}")
+    else:
+        dynamic_near = float(camera_distances.min() - scene_radius)
+        dynamic_far = float(camera_distances.max() + scene_radius)
+        print(f'Dynamic near: {dynamic_near}, far: {dynamic_far}')
+    
+    # Ensure reasonable bounds for 360° spherical scenes
+    dynamic_near = max(dynamic_near, 0.01)  # Prevent negative or zero near
+    dynamic_far = max(dynamic_far, dynamic_near + 0.1)  # Ensure far > near
 
     # --- Load model ---
     model = NeRFMLP().to(device)
     
-    # Check if best model exists, otherwise try final model
-    if not os.path.exists(model_path):
-        model_path = 'outputs/checkpoints/model_final.pth'
+    # Check if we should use the fine example weights
+    if use_fine_weights:
+        model_path = 'data/lego_example_weights/model_fine_200000.npy'
         if not os.path.exists(model_path):
-            print(f"Error: No model found at {model_path}")
-            print("Available models in outputs/checkpoints/:")
-            if os.path.exists('outputs/checkpoints/'):
-                for f in os.listdir('outputs/checkpoints/'):
-                    if f.endswith('.pth'):
-                        print(f"  - {f}")
+            print(f"Error: Fine weights not found at {model_path}")
             return
+    elif not os.path.exists(model_path):
+        # If the user-specified model doesn't exist, show error and available options
+        print(f"Error: Specified model not found at {model_path}")
+        
+        # Show available models as suggestions
+        checkpoint_dir = 'outputs/checkpoints/'
+        if os.path.exists(checkpoint_dir):
+            print("Available models in outputs/checkpoints/:")
+            for f in sorted(os.listdir(checkpoint_dir)):
+                if f.endswith('.pth'):
+                    print(f"  - {checkpoint_dir}{f}")
+        
+        # Check for other common locations
+        other_locations = ['outputs/lego_full_training/', 'outputs/test_fixed_preprocessing/']
+        for loc in other_locations:
+            if os.path.exists(loc):
+                models = [f for f in os.listdir(loc) if f.endswith('.pth')]
+                if models:
+                    print(f"Available models in {loc}:")
+                    for f in sorted(models):
+                        print(f"  - {loc}{f}")
+        
+        print(f"\nTip: Use --use_fine_weights to load the official example weights")
+        print(f"Or specify a valid model path with --model_path")
+        return
     
     print(f"Loading model from: {model_path}")
     if model_path.endswith('.npy'):
@@ -105,35 +153,73 @@ def main():
         print("Shapes of loaded .npy arrays:")
         for i, arr in enumerate(weights):
             print(f"  Weight {i}: {arr.shape}")
-        print("Shapes of model parameters (expected):")
+        print("Model parameter names/types and shapes (expected):")
         param_list = []
-        for l in model.pts_linears:
+        param_names = []
+        for idx, l in enumerate(model.pts_linears):
             param_list.append(l.weight.data)
+            param_names.append(f"pts_linears[{idx}].weight")
             param_list.append(l.bias.data)
-        param_list.append(model.feature_linear.weight.data)
-        param_list.append(model.feature_linear.bias.data)
+            param_names.append(f"pts_linears[{idx}].bias")
+        param_list.append(model.bottleneck_linear.weight.data)
+        param_names.append("bottleneck_linear.weight")
+        param_list.append(model.bottleneck_linear.bias.data)
+        param_names.append("bottleneck_linear.bias")
         param_list.append(model.sigma_linear.weight.data)
+        param_names.append("sigma_linear.weight")
         param_list.append(model.sigma_linear.bias.data)
+        param_names.append("sigma_linear.bias")
         if model.use_viewdirs:
             param_list.append(model.view_linear.weight.data)
+            param_names.append("view_linear.weight")
             param_list.append(model.view_linear.bias.data)
+            param_names.append("view_linear.bias")
         param_list.append(model.rgb_linear.weight.data)
+        param_names.append("rgb_linear.weight")
         param_list.append(model.rgb_linear.bias.data)
-        for i, p in enumerate(param_list):
-            print(f"  Model param {i}: {tuple(p.shape)}")
-        # Now try loading (will error, but you'll see the printout)
+        param_names.append("rgb_linear.bias")
+        for i, (p, n) in enumerate(zip(param_list, param_names)):
+            print(f"  Model param {i}: {n} {tuple(p.shape)}")
+        # Now try loading (should work)
         model.load_from_numpy(weights)
         print("Loaded weights from .npy file using load_from_numpy.")
     else:
         model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
-    renderer = NeRFRenderer(model, device, near=near, far=far)
+    
+    # Configure renderer parameters
+    # Auto-detect configuration based on model type
+    if use_fine_weights:
+        # Official example weights configuration
+        render_N_samples = N_samples if N_samples is not None else 64
+        render_N_importance = N_importance if N_importance is not None else 64
+        render_white_bkgd = True if white_bkgd else (False if no_white_bkgd else True)
+        print("🎯 Using official example weights configuration")
+    else:
+        # Your custom weights - use more standard NeRF settings
+        render_N_samples = N_samples if N_samples is not None else 64
+        render_N_importance = N_importance if N_importance is not None else 128
+        render_white_bkgd = True if white_bkgd else (False if no_white_bkgd else True)
+        print("🎯 Using custom weights configuration")
+    
+    print(f"📊 Renderer config: N_samples={render_N_samples}, N_importance={render_N_importance}, white_bkgd={render_white_bkgd}")
+    
+    renderer = NeRFRenderer(
+        model, device, 
+        near=dynamic_near, far=dynamic_far, 
+        N_samples=render_N_samples,
+        N_importance=render_N_importance,
+        white_bkgd=render_white_bkgd,
+        perturb=0.0,           # DISABLE perturbation during inference
+        raw_noise_std=0.0,     # DISABLE noise during inference
+        coord_scale=coord_scale  # Apply coordinate scaling
+    )
 
     # --- Render multiple views ---
     with torch.no_grad():
         if view_idx is not None:
-            pose_idx = view_idx % n_poses
-            pose = poses[pose_idx]
+            pose_idx = view_idx % len(poses_for_rendering)
+            pose = poses_for_rendering[pose_idx]
             print(f"Rendering view {pose_idx} (user-specified)")
             print(f"Camera position: {pose[:3, 3]}")
             i, j = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')
@@ -153,8 +239,8 @@ def main():
             print("---")
         else:
             for idx in range(num_views):
-                pose_idx = idx % n_poses  # cycle if fewer than 5 poses
-                pose = poses[pose_idx]
+                pose_idx = idx % len(poses_for_rendering)  # cycle if fewer than 5 poses
+                pose = poses_for_rendering[pose_idx]
                 print(f"Rendering view {idx} using pose {pose_idx}")
                 print(f"Camera position: {pose[:3, 3]}")
                 i, j = np.meshgrid(np.arange(W), np.arange(H), indexing='xy')

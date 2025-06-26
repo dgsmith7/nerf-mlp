@@ -49,11 +49,31 @@ def main():
         near = max(0.1, dists.min() - 0.5)
         far = dists.max() + 0.5
 
-    # Load model
+    # Load model with support for both .npy and .pth formats
     model = NeRFMLP().to(device)
-    model.load_state_dict(torch.load(args.model_path, map_location=device))
+    
+    print(f"Loading model from: {args.model_path}")
+    if args.model_path.endswith('.npy'):
+        # Load weights from numpy file (official example weights)
+        weights = np.load(args.model_path, allow_pickle=True)
+        if isinstance(weights, np.lib.npyio.NpzFile):
+            weights = [weights[key] for key in weights.files]
+        elif isinstance(weights, np.ndarray) and weights.dtype == object:
+            weights = list(weights)
+        model.load_from_numpy(weights)
+        print("✅ Loaded weights from .npy file using load_from_numpy")
+        # Configure for official weights
+        N_samples, N_importance = 64, 64
+    else:
+        # Load PyTorch checkpoint
+        model.load_state_dict(torch.load(args.model_path, map_location=device))
+        print("✅ Loaded weights from .pth file")
+        # Configure for custom weights  
+        N_samples, N_importance = 64, 128
+    
     model.eval()
-    renderer = NeRFRenderer(model, device, near=near, far=far)
+    renderer = NeRFRenderer(model, device, near=near, far=far, 
+                           N_samples=N_samples, N_importance=N_importance)
 
     # Render the view
     with torch.no_grad():

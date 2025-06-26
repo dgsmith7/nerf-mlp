@@ -3,22 +3,30 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, num_freqs, include_input=True):
+    def __init__(self, num_freqs, include_input=True, log_sampling=True):
         super().__init__()
         self.num_freqs = num_freqs
         self.include_input = include_input
-        self.freq_bands = 2.0 ** torch.arange(num_freqs)
+        self.log_sampling = log_sampling
+        
+        if log_sampling:
+            # Match official implementation exactly: tf.linspace(0., max_freq, N_freqs)
+            # This creates frequencies: [2^0, 2^1, 2^2, ..., 2^(num_freqs-1)]
+            self.freq_bands = 2.0 ** torch.linspace(0., num_freqs-1, num_freqs)
+        else:
+            # Linear sampling: tf.linspace(2.**0., 2.**max_freq, N_freqs)
+            self.freq_bands = torch.linspace(2.**0, 2.**(num_freqs-1), num_freqs)
 
     def forward(self, x):
         # x: (..., input_dim)
         out = [x] if self.include_input else []
         for freq in self.freq_bands:
-            out.append(torch.sin(freq * torch.pi * x))
-            out.append(torch.cos(freq * torch.pi * x))
+            out.append(torch.sin(freq * x))  # Match official - no pi multiplication
+            out.append(torch.cos(freq * x))
         return torch.cat(out, dim=-1)
 
 class NeRFMLP(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=63, input_ch_views=27, skips=[4],
+    def __init__(self, D=8, W=256, input_ch=63, input_ch_views=27, skips=[5],
                  use_viewdirs=True, output_ch=4):
         super().__init__()
         self.D = D
@@ -28,58 +36,92 @@ class NeRFMLP(nn.Module):
         self.skips = skips
         self.use_viewdirs = use_viewdirs
 
+        # Main MLP layers - REVERT: skip at layer 5 (index 5) to match saved weights
         self.pts_linears = nn.ModuleList(
-            [nn.Linear(input_ch, W)] + [nn.Linear(W, W) if i not in self.skips else nn.Linear(W + input_ch, W) for i in range(1, D)]
+            [nn.Linear(input_ch, W)] +                    # Layer 0
+            [nn.Linear(W, W) for _ in range(1, 5)] +      # Layers 1-4  
+            [nn.Linear(W + input_ch, W)] +                # Layer 5 (skip layer)
+            [nn.Linear(W, W) for _ in range(6, D)]        # Layers 6-7
         )
-        self.sigma_linear = nn.Linear(W, 1)
-        self.feature_linear = nn.Linear(W, W)
-
+        
         if use_viewdirs:
-            self.view_linear = nn.Linear(W + input_ch_views, 128)
-            self.rgb_linear = nn.Linear(128, 3)
+            # Match official architecture: separate sigma and bottleneck branches
+            self.sigma_linear = nn.Linear(W, 1)  # Alpha/sigma branch
+            self.bottleneck_linear = nn.Linear(W, 256)  # Bottleneck for viewdirs
+            # Viewdirs branch: bottleneck + viewdirs -> 1 hidden layer (128) -> RGB
+            self.view_linear = nn.Linear(256 + input_ch_views, W//2)  # W//2 = 128
+            self.rgb_linear = nn.Linear(W//2, 3)
         else:
-            self.rgb_linear = nn.Linear(W, 3)
+            self.output_linear = nn.Linear(W, output_ch)
 
     def forward(self, x, viewdirs=None):
         # x: (N_rays*N_samples, input_ch)
-        # viewdirs: (N_rays, input_ch_views)
+        # viewdirs: (N_rays*N_samples, input_ch_views)
         h = x
         for i, l in enumerate(self.pts_linears):
-            if i in self.skips:
+            if i == 5:  # REVERT: Skip at layer 5 to match saved weights
                 h = torch.cat([x, h], -1)
             h = l(h)
             h = F.relu(h)
-        sigma = self.sigma_linear(h)
-        feature = self.feature_linear(h)
+        
         if self.use_viewdirs and viewdirs is not None:
-            h = torch.cat([feature, viewdirs], -1)
+            # Match official architecture exactly
+            sigma = self.sigma_linear(h)  # Alpha/sigma branch
+            bottleneck = self.bottleneck_linear(h)  # Bottleneck branch
+            # Concatenate bottleneck with viewdirs
+            h = torch.cat([bottleneck, viewdirs], -1)
             h = self.view_linear(h)
             h = F.relu(h)
             rgb = self.rgb_linear(h)
+            # Concatenate RGB and sigma (sigma last, matching official)
+            outputs = torch.cat([rgb, sigma], -1)
         else:
-            rgb = self.rgb_linear(feature)
-        outputs = torch.cat([rgb, sigma], -1)  # (N_rays*N_samples, 4)
+            outputs = self.output_linear(h)
+        
         return outputs
 
     def load_from_numpy(self, np_arrays):
         # Load weights from a list of numpy arrays in the order found in the .npy files
+        # Official order (FIXED to match skip at layer 4):
+        # 0-15: main MLP (8 layers) - with skip at layer 4
+        # 16-17: bottleneck_linear (256,256), (256,)
+        # 18-19: view_linear (283,128), (128,)
+        # 20-21: rgb_linear (128,3), (3,)
+        # 22-23: sigma_linear (256,1), (1,)
         idx = 0
-        # Input and hidden layers
-        for l in self.pts_linears:
+        # Main MLP layers
+        for i, l in enumerate(self.pts_linears):
+            print(f"Loading pts_linears[{i}].weight with shape {l.weight.data.shape} from np_arrays[{idx}].T {np_arrays[idx].shape}")
             l.weight.data.copy_(torch.from_numpy(np_arrays[idx].T))
+            print(f"Loading pts_linears[{i}].bias with shape {l.bias.data.shape} from np_arrays[{idx+1}].shape {np_arrays[idx+1].shape}")
             l.bias.data.copy_(torch.from_numpy(np_arrays[idx+1]))
             idx += 2
-        # Feature and sigma
-        self.feature_linear.weight.data.copy_(torch.from_numpy(np_arrays[idx].T))
-        self.feature_linear.bias.data.copy_(torch.from_numpy(np_arrays[idx+1]))
-        idx += 2
-        self.sigma_linear.weight.data.copy_(torch.from_numpy(np_arrays[idx].T))
-        self.sigma_linear.bias.data.copy_(torch.from_numpy(np_arrays[idx+1]))
-        idx += 2
-        # Viewdir and rgb
         if self.use_viewdirs:
+            # Bottleneck
+            print(f"Loading bottleneck_linear.weight with shape {self.bottleneck_linear.weight.data.shape} from np_arrays[{idx}].T {np_arrays[idx].shape}")
+            self.bottleneck_linear.weight.data.copy_(torch.from_numpy(np_arrays[idx].T))
+            print(f"Loading bottleneck_linear.bias with shape {self.bottleneck_linear.bias.data.shape} from np_arrays[{idx+1}].shape {np_arrays[idx+1].shape}")
+            self.bottleneck_linear.bias.data.copy_(torch.from_numpy(np_arrays[idx+1]))
+            idx += 2
+            # Viewdirs
+            print(f"Loading view_linear.weight with shape {self.view_linear.weight.data.shape} from np_arrays[{idx}].T {np_arrays[idx].shape}")
             self.view_linear.weight.data.copy_(torch.from_numpy(np_arrays[idx].T))
+            print(f"Loading view_linear.bias with shape {self.view_linear.bias.data.shape} from np_arrays[{idx+1}].shape {np_arrays[idx+1].shape}")
             self.view_linear.bias.data.copy_(torch.from_numpy(np_arrays[idx+1]))
             idx += 2
-        self.rgb_linear.weight.data.copy_(torch.from_numpy(np_arrays[idx].T))
-        self.rgb_linear.bias.data.copy_(torch.from_numpy(np_arrays[idx+1])) 
+            # RGB
+            print(f"Loading rgb_linear.weight with shape {self.rgb_linear.weight.data.shape} from np_arrays[{idx}].T {np_arrays[idx].shape}")
+            self.rgb_linear.weight.data.copy_(torch.from_numpy(np_arrays[idx].T))
+            print(f"Loading rgb_linear.bias with shape {self.rgb_linear.bias.data.shape} from np_arrays[{idx+1}].shape {np_arrays[idx+1].shape}")
+            self.rgb_linear.bias.data.copy_(torch.from_numpy(np_arrays[idx+1]))
+            idx += 2
+            # Sigma
+            print(f"Loading sigma_linear.weight with shape {self.sigma_linear.weight.data.shape} from np_arrays[{idx}].T {np_arrays[idx].shape}")
+            self.sigma_linear.weight.data.copy_(torch.from_numpy(np_arrays[idx].T))
+            print(f"Loading sigma_linear.bias with shape {self.sigma_linear.bias.data.shape} from np_arrays[{idx+1}].shape {np_arrays[idx+1].shape}")
+            self.sigma_linear.bias.data.copy_(torch.from_numpy(np_arrays[idx+1]))
+        else:
+            print(f"Loading output_linear.weight with shape {self.output_linear.weight.data.shape} from np_arrays[{idx}].T {np_arrays[idx].shape}")
+            self.output_linear.weight.data.copy_(torch.from_numpy(np_arrays[idx].T))
+            print(f"Loading output_linear.bias with shape {self.output_linear.bias.data.shape} from np_arrays[{idx+1}].shape {np_arrays[idx+1].shape}")
+            self.output_linear.bias.data.copy_(torch.from_numpy(np_arrays[idx+1])) 

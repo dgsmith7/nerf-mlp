@@ -100,7 +100,7 @@ def display_progress(metrics):
 def main():
     parser = argparse.ArgumentParser(description='Quick view of training progress')
     parser.add_argument('--metrics-dir', type=str, 
-                       default='outputs/checkpoints',
+                       default='outputs/lego_full_training',
                        help='Directory containing metrics files')
     
     args = parser.parse_args()

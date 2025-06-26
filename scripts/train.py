@@ -208,12 +208,12 @@ def main():
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
     print(f'Using device: {device}')
 
-    # Load datasets
-    dataset = NeRFDataset(args.datadir, split=args.split, img_wh=tuple(args.img_wh))
-    val_dataset = NeRFDataset(args.datadir, split='val', img_wh=tuple(args.img_wh))
+    # Load datasets with proper white background preprocessing
+    dataset = NeRFDataset(args.datadir, split=args.split, img_wh=tuple(args.img_wh), white_bkgd=True)
+    val_dataset = NeRFDataset(args.datadir, split='val', img_wh=tuple(args.img_wh), white_bkgd=True)
     
     # Quick validation dataset (lower resolution, subset)
-    quick_val_dataset = NeRFDataset(args.datadir, split='val', img_wh=tuple(args.quick_val_res))
+    quick_val_dataset = NeRFDataset(args.datadir, split='val', img_wh=tuple(args.quick_val_res), white_bkgd=True)
     
     batch_size = args.batch_size
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)

@@ -60,8 +60,8 @@ def main():
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
     
-    # Dataset and dataloader
-    dataset = NeRFDataset(args.datadir, img_wh=args.img_wh)
+    # Dataset and dataloader with proper white background preprocessing
+    dataset = NeRFDataset(args.datadir, img_wh=args.img_wh, white_bkgd=True)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
     
     print(f'Total rays: {len(dataset)} | Batch size: {args.batch_size}')

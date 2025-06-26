@@ -5,12 +5,29 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 
+def srgb_to_linear(img):
+    """
+    Convert sRGB image to linear RGB with proper gamma correction.
+    
+    The standard sRGB to linear conversion as used in NeRF:
+    - For values <= 0.04045: linear = srgb / 12.92
+    - For values > 0.04045: linear = ((srgb + 0.055) / 1.055)^2.4
+    """
+    img = img.astype(np.float32)
+    linear = np.where(
+        img <= 0.04045,
+        img / 12.92,
+        np.power((img + 0.055) / 1.055, 2.4)
+    )
+    return linear
+
 class NeRFDataset(Dataset):
-    def __init__(self, datadir, split='train', img_wh=(400, 400)):
+    def __init__(self, datadir, split='train', img_wh=(400, 400), white_bkgd=True):
         super().__init__()
         self.datadir = datadir
         self.split = split
         self.img_wh = img_wh
+        self.white_bkgd = white_bkgd
         self._load_meta()
         self._load_images_and_poses()
         self._generate_rays()
@@ -25,14 +42,35 @@ class NeRFDataset(Dataset):
         self.poses = []
         for i, frame in enumerate(self.meta['frames']):
             fname = os.path.join(self.datadir, self.split, frame['file_path'].split('/')[-1] + '.png')
-            img = Image.open(fname).convert('RGB')
+            img = Image.open(fname).convert('RGBA')  # Load with alpha channel
             img = img.resize(self.img_wh, Image.Resampling.LANCZOS)
-            img = np.array(img) / 255.0
+            img = np.array(img) / 255.0  # Convert to 0-1 range first
+            
+            # Handle alpha compositing with white background (standard NeRF preprocessing)
+            if img.shape[2] == 4:  # RGBA
+                rgb = img[..., :3]
+                alpha = img[..., 3:]
+                if self.white_bkgd:
+                    # Composite with white background: rgb = rgb * alpha + white * (1 - alpha)
+                    rgb = rgb * alpha + (1 - alpha)  # white background = 1
+                else:
+                    # Keep alpha channel
+                    rgb = np.concatenate([rgb, alpha], axis=-1)
+                img = rgb
+            
+            # Convert from sRGB to linear RGB (proper gamma correction)
+            img = srgb_to_linear(img)
+            
             self.images.append(img)
             pose = np.array(frame['transform_matrix'], dtype=np.float32)
             self.poses.append(pose)
+        # Convert to numpy arrays and check shapes
         self.images = np.stack(self.images, axis=0)  # (N_images, H, W, 3)
         self.poses = np.stack(self.poses, axis=0)    # (N_images, 4, 4)
+        
+        # Print shape information for debugging
+        print(f"Loaded {len(self.images)} images with shape: {self.images.shape}")
+        print(f"Image value range: [{self.images.min():.3f}, {self.images.max():.3f}]")
         self.focal = 0.5 * self.img_wh[0] / np.tan(0.5 * self.meta['camera_angle_x'])
 
     def _generate_rays(self):

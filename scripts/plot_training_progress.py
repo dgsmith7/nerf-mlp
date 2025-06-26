@@ -157,29 +157,159 @@ Best Validation PSNR: {metrics.get('best_val_psnr', 0):.2f} dB
 
 def animate_progress(metrics_file, save_dir, interval=5000):
     """Create an animated plot that updates automatically."""
+    import matplotlib
+    
+    # Try different backends in order of preference
+    backends_to_try = ['Qt5Agg', 'MacOSX', 'Agg']
+    backend_set = False
+    
+    for backend in backends_to_try:
+        try:
+            matplotlib.use(backend)
+            backend_set = True
+            print(f"Using matplotlib backend: {backend}")
+            break
+        except ImportError:
+            continue
+    
+    if not backend_set:
+        print("Warning: Could not set a GUI backend for live plotting. Using default.")
+    
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     fig.suptitle('NeRF Training Progress (Live)', fontsize=16, fontweight='bold')
     
     def update(frame):
-        # Clear all axes
-        for ax in axes.flat:
-            ax.clear()
-        
         # Load latest metrics
         metrics = load_metrics(metrics_file)
         if not metrics:
             return []
         
-        # Recreate the plot
-        create_progress_plot(metrics, None, show_plot=False)
+        # Clear all axes
+        for ax in axes.flat:
+            ax.clear()
         
-        # Update the current figure
-        plt.draw()
+        # Recreate plots with current data
+        artists = _create_plots_on_axes(metrics, axes)
+        
+        plt.tight_layout()
+        return artists if artists else []
+    
+    # Create animation with explicit save_count to avoid warning
+    ani = FuncAnimation(fig, update, interval=interval, repeat=True, 
+                       cache_frame_data=False, save_count=100)
+    
+    try:
+        plt.show()
+    except Exception as e:
+        print(f"Error displaying live plot: {e}")
+        print("Try using the static plotting instead: python scripts/plot_training_progress.py")
+    
+    return ani
+
+def _create_plots_on_axes(metrics, axes):
+    """Helper function to create plots on provided axes."""
+    if not metrics:
         return []
     
-    # Create animation
-    ani = FuncAnimation(fig, update, interval=interval, repeat=True)
-    plt.show()
+    # Extract data
+    train_losses = metrics.get('train_losses', [])
+    train_psnrs = metrics.get('train_psnrs', [])
+    quick_val_losses = metrics.get('quick_val_losses', [])
+    quick_val_psnrs = metrics.get('quick_val_psnrs', [])
+    quick_val_ssims = metrics.get('quick_val_ssims', [])
+    val_steps = metrics.get('val_steps', [])
+    iteration_times = metrics.get('iteration_times', [])
+    
+    if not val_steps:
+        return []
+    
+    # 1. Loss convergence
+    ax1 = axes[0, 0]
+    if train_losses and quick_val_losses:
+        ax1.plot(val_steps, train_losses, label='Training Loss', marker='o', markersize=3, linewidth=1.5, color='blue', alpha=0.8)
+        ax1.plot(val_steps, quick_val_losses, label='Validation Loss', marker='s', markersize=3, linewidth=1.5, color='red', alpha=0.8)
+        ax1.set_xlabel('Iteration')
+        ax1.set_ylabel('Loss')
+        ax1.set_title('Training vs Validation Loss')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        ax1.set_yscale('log')
+    
+    # 2. PSNR convergence
+    ax2 = axes[0, 1]
+    if train_psnrs and quick_val_psnrs:
+        ax2.plot(val_steps, train_psnrs, label='Training PSNR', marker='o', markersize=3, linewidth=1.5, color='green', alpha=0.8)
+        ax2.plot(val_steps, quick_val_psnrs, label='Validation PSNR', marker='s', markersize=3, linewidth=1.5, color='orange', alpha=0.8)
+        ax2.set_xlabel('Iteration')
+        ax2.set_ylabel('PSNR (dB)')
+        ax2.set_title('Training vs Validation PSNR')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+    
+    # 3. SSIM progress
+    ax3 = axes[0, 2]
+    if quick_val_ssims:
+        ax3.plot(val_steps, quick_val_ssims, label='Validation SSIM', marker='s', markersize=3, color='purple', alpha=0.8)
+        ax3.set_xlabel('Iteration')
+        ax3.set_ylabel('SSIM')
+        ax3.set_title('SSIM Progress')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+    
+    # 4. Overfitting indicator
+    ax4 = axes[1, 0]
+    if train_losses and quick_val_losses and len(train_losses) == len(quick_val_losses):
+        loss_diff = [abs(t - v) for t, v in zip(train_losses, quick_val_losses)]
+        ax4.plot(val_steps, loss_diff, marker='o', markersize=3, color='purple', alpha=0.8)
+        ax4.set_xlabel('Iteration')
+        ax4.set_ylabel('|Train - Val Loss|')
+        ax4.set_title('Overfitting Indicator')
+        ax4.grid(True, alpha=0.3)
+        ax4.set_yscale('log')
+    
+    # 5. Training time per iteration
+    ax5 = axes[1, 1]
+    if iteration_times and len(iteration_times) > 10:
+        recent_times = iteration_times[-100:]
+        ax5.plot(recent_times, alpha=0.6, color='brown')
+        ax5.set_xlabel('Recent Iterations')
+        ax5.set_ylabel('Time (seconds)')
+        ax5.set_title('Training Time per Iteration')
+        ax5.grid(True, alpha=0.3)
+    
+    # 6. Summary
+    ax6 = axes[1, 2]
+    ax6.axis('off')
+    
+    if train_losses and quick_val_losses and train_psnrs and quick_val_psnrs:
+        current_train_loss = train_losses[-1]
+        current_val_loss = quick_val_losses[-1]
+        current_train_psnr = train_psnrs[-1]
+        current_val_psnr = quick_val_psnrs[-1]
+        
+        loss_improvement = ((train_losses[0] - current_train_loss) / train_losses[0]) * 100 if len(train_losses) > 1 else 0
+        psnr_improvement = current_train_psnr - train_psnrs[0] if len(train_psnrs) > 1 else 0
+        
+        summary_text = f"""
+Current Status:
+• Iteration: {val_steps[-1]}
+• Training Loss: {current_train_loss:.6f}
+• Validation Loss: {current_val_loss:.6f}
+• Training PSNR: {current_train_psnr:.2f} dB
+• Validation PSNR: {current_val_psnr:.2f} dB
+
+Improvement:
+• Loss: {loss_improvement:.1f}% reduction
+• PSNR: {psnr_improvement:+.2f} dB gain
+
+Best Validation PSNR: {metrics.get('best_val_psnr', 0):.2f} dB
+        """
+        
+        ax6.text(0.1, 0.9, summary_text, transform=ax6.transAxes, fontsize=10,
+                verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray", alpha=0.8))
+
+    return [ax1, ax2, ax3, ax4, ax5, ax6]
 
 def main():
     parser = argparse.ArgumentParser(description='Plot NeRF training progress')
