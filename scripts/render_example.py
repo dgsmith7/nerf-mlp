@@ -9,6 +9,22 @@ import numpy as np
 from PIL import Image
 from nerfmlp import NeRFMLP, NeRFRenderer, NeRFDataset
 
+def linear_to_srgb(img):
+    """
+    Convert linear RGB to sRGB with proper gamma correction.
+    
+    The standard linear to sRGB conversion (inverse of sRGB to linear):
+    - For values <= 0.0031308: srgb = linear * 12.92
+    - For values > 0.0031308: srgb = 1.055 * linear^(1/2.4) - 0.055
+    """
+    img = img.astype(np.float32)
+    srgb = np.where(
+        img <= 0.0031308,
+        img * 12.92,
+        1.055 * np.power(img, 1/2.4) - 0.055
+    )
+    return srgb
+
 def main():
     parser = argparse.ArgumentParser(description='Render test images from trained NeRF model')
     parser.add_argument('--model_path', type=str, default='outputs/checkpoints/model_best.pth',
@@ -38,6 +54,8 @@ def main():
     parser.add_argument('--near', type=float, default=None, help='Near bound override')
     parser.add_argument('--far', type=float, default=None, help='Far bound override')
     parser.add_argument('--coord_scale', type=float, default=None, help='Coordinate scaling factor to match model expectations')
+    parser.add_argument('--gamma_correction', action='store_true', help='Apply linear to sRGB gamma correction (can wash out colors)')
+    parser.add_argument('--brightness_boost', type=float, default=1.0, help='Brightness multiplier (default: 1.0, try 1.1-1.3 for subtle boost)')
     args = parser.parse_args()
 
     # --- Config ---
@@ -94,14 +112,16 @@ def main():
     camera_distances = np.linalg.norm(np.array([pose[:3, 3] for pose in poses_for_bounds]) - scene_center, axis=1)
     scene_radius = camera_distances.max()
     
-    # Use dynamic bounds, with command line overrides if provided
+    # Use training-consistent bounds, with command line overrides if provided
     if near is not None and far is not None:
         dynamic_near, dynamic_far = near, far
         print(f"Using command line bounds: near={dynamic_near}, far={dynamic_far}")
     else:
-        dynamic_near = float(camera_distances.min() - scene_radius)
-        dynamic_far = float(camera_distances.max() + scene_radius)
-        print(f'Dynamic near: {dynamic_near}, far: {dynamic_far}')
+        # Use training bounds (2.0, 6.0) instead of dynamic calculation
+        # Dynamic bounds often mismatch what the model learned during training
+        dynamic_near, dynamic_far = 2.0, 6.0
+        print(f'Using training-consistent bounds: near={dynamic_near}, far={dynamic_far}')
+        print(f'(Dynamic would have been: near={float(camera_distances.min() - scene_radius):.3f}, far={float(camera_distances.max() + scene_radius):.3f})')
     
     # Ensure reasonable bounds for 360° spherical scenes
     dynamic_near = max(dynamic_near, 0.01)  # Prevent negative or zero near
@@ -230,9 +250,25 @@ def main():
             rays_d = torch.from_numpy(rays_d).float().to(device)
             rgb = renderer.render(rays_o, rays_d, H, W, focal)
             rgb = rgb.cpu().numpy()
-            print(f"Rendered RGB range: {rgb.min():.3f} to {rgb.max():.3f}")
-            print(f"Rendered RGB mean: {rgb.mean():.3f}")
-            rgb = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+            print(f"Rendered RGB range (linear): {rgb.min():.3f} to {rgb.max():.3f}")
+            print(f"Rendered RGB mean (linear): {rgb.mean():.3f}")
+            
+            # Apply brightness boost if requested
+            if args.brightness_boost != 1.0:
+                rgb = rgb * args.brightness_boost
+                print(f"Applied brightness boost: {args.brightness_boost}x")
+            
+            if args.gamma_correction:
+                # Convert from linear RGB to sRGB for proper display
+                rgb_srgb = linear_to_srgb(rgb)
+                print(f"Rendered RGB range (sRGB): {rgb_srgb.min():.3f} to {rgb_srgb.max():.3f}")
+                print(f"Rendered RGB mean (sRGB): {rgb_srgb.mean():.3f}")
+                rgb_final = rgb_srgb
+            else:
+                print("Using linear RGB output (default - no gamma correction)")
+                rgb_final = rgb
+            
+            rgb = (np.clip(rgb_final, 0, 1) * 255).astype(np.uint8)
             out_path = f'{out_prefix}_view{pose_idx}.png'
             Image.fromarray(rgb).save(out_path)
             print(f"Rendered image saved to {out_path}")
@@ -251,9 +287,25 @@ def main():
                 rays_d = torch.from_numpy(rays_d).float().to(device)
                 rgb = renderer.render(rays_o, rays_d, H, W, focal)
                 rgb = rgb.cpu().numpy()
-                print(f"Rendered RGB range: {rgb.min():.3f} to {rgb.max():.3f}")
-                print(f"Rendered RGB mean: {rgb.mean():.3f}")
-                rgb = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+                print(f"Rendered RGB range (linear): {rgb.min():.3f} to {rgb.max():.3f}")
+                print(f"Rendered RGB mean (linear): {rgb.mean():.3f}")
+                
+                # Apply brightness boost if requested
+                if args.brightness_boost != 1.0:
+                    rgb = rgb * args.brightness_boost
+                    print(f"Applied brightness boost: {args.brightness_boost}x")
+                
+                if args.gamma_correction:
+                    # Convert from linear RGB to sRGB for proper display
+                    rgb_srgb = linear_to_srgb(rgb)
+                    print(f"Rendered RGB range (sRGB): {rgb_srgb.min():.3f} to {rgb_srgb.max():.3f}")
+                    print(f"Rendered RGB mean (sRGB): {rgb_srgb.mean():.3f}")
+                    rgb_final = rgb_srgb
+                else:
+                    print("Using linear RGB output (default - no gamma correction)")
+                    rgb_final = rgb
+                
+                rgb = (np.clip(rgb_final, 0, 1) * 255).astype(np.uint8)
                 out_path = f'{out_prefix}_{idx}.png'
                 Image.fromarray(rgb).save(out_path)
                 print(f"Rendered image saved to {out_path}")
